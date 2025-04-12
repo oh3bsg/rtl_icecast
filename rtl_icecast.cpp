@@ -339,6 +339,7 @@ void print_buffer_stats() {
 void rtl_callback(unsigned char *buf, uint32_t len, void *) {
     // Calculate signal strength (RMS of I/Q samples)
     float sum_squared = 0.0f;
+    float bw_squared = 0.0f;
     std::vector<std::complex<float>> filtered_samples(len/2);
     
     // Convert samples and apply filtering
@@ -347,6 +348,8 @@ void rtl_callback(unsigned char *buf, uint32_t len, void *) {
         float q_sample = (buf[i + 1] - 127.5f) / 127.5f;
         std::complex<float> sample(i_sample, q_sample);
         
+        bw_squared += std::norm(sample);
+
         // Apply FM channel filter
         std::complex<float> filtered;
         iirfilt_crcf_execute(filter, sample, &filtered);
@@ -355,12 +358,59 @@ void rtl_callback(unsigned char *buf, uint32_t len, void *) {
         sum_squared += std::norm(filtered);
     }
     
+    float bw_rms = std::sqrt(bw_squared / (len/2));
+    float bw_db = 20 * std::log10(bw_rms + 1e-10);
+
     float rms = std::sqrt(sum_squared / (len/2));
     float db = 20 * std::log10(rms + 1e-10);
     signal_strength.store(db);
     
+    float snr;
+    if (g_config.mode == ModulationMode::NFM_MODE) snr = (db+12)-bw_db;
+    else if (g_config.mode == ModulationMode::AM_MODE) snr = (db+17)-bw_db;
+    else snr = (db+12)-bw_db;
+    //printf("Signal level db= %f / bw_bd= %f  diff %f SNR %f\n" , db, bw_db, bw_db-db, snr);
+
     // Check squelch
-    bool is_squelched = false;
+    static bool is_squelched = true;
+#if 1 // SNR squelch
+    if (snr > 3.0f) {
+        squelch_active = false;
+        //updateMetadata = true;
+        //metadB = db;
+        is_squelched = false;
+        printf("SNR(%f)\n", snr);
+    }
+    else {
+        squelch_active = true;
+        is_squelched = true;
+#if 0
+        if (g_config.scanEnabled) {
+            double frq = scanner->NextCh(squelch_active);
+            if (frq != 0) {
+                change_frequency(frq);
+            }
+        }
+#endif // 0
+    }
+#endif // 0
+
+#if 0 // hystereesi squelch
+    if (g_config.squelch_enabled) {
+        if ((db >= g_config.squelch_threshold) && squelch_active) {
+            squelch_active = false;
+            updateMetadata = true;
+            metadB = db;
+            is_squelched = false;
+        }
+        else if ((db <= (g_config.squelch_threshold-7)) && !squelch_active) {
+            squelch_active = true;
+            is_squelched = true;
+        }
+    }
+#endif // 0
+
+#if 0 // original squelch
     if (g_config.squelch_enabled) {
         auto now = std::chrono::steady_clock::now();
         if (db >= g_config.squelch_threshold) {
@@ -377,6 +427,7 @@ void rtl_callback(unsigned char *buf, uint32_t len, void *) {
             }
         }
     }
+#endif // 0
     
     // Process IQ samples
     std::vector<float> demod_buffer(len / 2);
@@ -433,7 +484,7 @@ void update_icecast_metadata(shout_t* shout, double freq_mhz, float signal_db) {
     
     // Format frequency as artist name
     std::stringstream artist_ss;
-    artist_ss << std::fixed << std::setprecision(2) << freq_mhz << " MHz";
+    artist_ss << std::fixed << std::setprecision(3) << freq_mhz << " MHz";
     std::string artist = artist_ss.str();
     
     // Format signal strength as song title
@@ -759,7 +810,7 @@ void change_frequency(double new_freq_mhz) {
         std::cerr << "Failed to set frequency to " << new_freq_mhz << " MHz\n";
     } else {
         g_config.center_freq = new_freq_mhz;
-        std::cout << "Tuned to " << new_freq_mhz << " MHz\n";
+        //std::cout << "Tuned to " << new_freq_mhz << " MHz\n";
     }
 }
 
@@ -975,7 +1026,7 @@ int main(int argc, char* argv[]) {
         auto now = std::chrono::steady_clock::now();
         if (std::chrono::duration_cast<std::chrono::seconds>(now - last_status_time).count() >= 1) {
             if (!quiet) {
-                print_status();
+                //print_status();
             }
             last_status_time = now;
         }
@@ -1025,9 +1076,11 @@ int main(int argc, char* argv[]) {
         }
 
         if (g_config.scanEnabled) {
-            double frq = scanner->NextCh(squelch_active);
-            if (frq != 0) {
-                change_frequency(frq);
+            if (squelch_active) {
+                double frq = scanner->NextCh(squelch_active);
+                if (frq != 0) {
+                    change_frequency(frq);
+                }
             }
         }
     }
