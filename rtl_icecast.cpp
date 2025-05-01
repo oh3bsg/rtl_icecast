@@ -26,6 +26,27 @@ enum class FMMode {
     WIDE,
 };
 
+enum class ScanType {
+    SINGLE,     // No scan
+    SEARCH,     // Search all frequencies
+    MEMORY      // Memory scanning
+};
+
+typedef struct {
+    // Sample context
+    uint32_t sampleRate;
+    uint32_t centerFrequency;
+    bool isSampleBufferReady;
+    uint32_t sampleBufferLen;
+    std::vector<std::complex<float>> sampleBuffer;
+
+    // Decode context
+    ModulationMode mode;
+    ScanType scanType;
+    uint32_t scanStep; // scan step (25000, 12500, 6250...)
+    int16_t prevIndex;  // index of previous frequency. -1 no prev
+} sampleContext_t;
+
 // Quiet mode
 bool quiet = false;
 
