@@ -33,6 +33,8 @@ enum class ScanType {
 };
 
 typedef struct {
+    void *dev;
+
     // Sample context
     uint32_t sampleRate;
     uint32_t centerFrequency;
@@ -357,25 +359,30 @@ void print_buffer_stats() {
 }
 
 // Callback function to receive IQ samples
-void rtl_callback(unsigned char *buf, uint32_t len, void *) {
+void rtl_callback(unsigned char *buf, uint32_t len, void *ctx) {
     // Calculate signal strength (RMS of I/Q samples)
-    float sum_squared = 0.0f;
-    std::vector<std::complex<float>> filtered_samples(len/2);
+    sampleContext_t *context = (sampleContext_t *)ctx;
+    //float sum_squared = 0.0f;
+    //std::vector<std::complex<float>> filtered_samples(len/2);
     
     // Convert samples and apply filtering
     for (uint32_t i = 0; i < len; i += 2) {
         float i_sample = (buf[i] - 127.5f) / 127.5f;
         float q_sample = (buf[i + 1] - 127.5f) / 127.5f;
         std::complex<float> sample(i_sample, q_sample);
-        
+        context->sampleBuffer.insert(context->sampleBuffer.begin()+(i/2), sample);
+#if 0        
         // Apply FM channel filter
         std::complex<float> filtered;
         iirfilt_crcf_execute(filter, sample, &filtered);
         filtered_samples[i/2] = filtered;
         
         sum_squared += std::norm(filtered);
+#endif // 0
     }
-    
+    context->sampleBufferLen = len/2;
+    context->isSampleBufferReady = true;
+#if 0    
     float rms = std::sqrt(sum_squared / (len/2));
     float db = 20 * std::log10(rms + 1e-10);
     signal_strength.store(db);
@@ -434,12 +441,13 @@ void rtl_callback(unsigned char *buf, uint32_t len, void *) {
             audio_buffer.push_back(sample);
         }
     }
+#endif // 0
 }
 
 // Thread function for RTL-SDR reading
-void rtl_thread_function(rtlsdr_dev_t *dev) {
+void rtl_thread_function(sampleContext_t *ctx) {
     printf("Starting RTL-SDR thread\n");
-    if (rtlsdr_read_async(dev, rtl_callback, nullptr, 0, RTL_READ_SIZE) < 0) {
+    if (rtlsdr_read_async((rtlsdr_dev_t *)ctx->dev, rtl_callback, ctx, 0, RTL_READ_SIZE) < 0) {
         std::cerr << "Failed to start async reading\n";
         running = false;
     }
@@ -849,6 +857,8 @@ int main(int argc, char* argv[]) {
 
     scanner = new Scanner(g_config.scanlist);
     scanner->SetStepDelay(g_config.step_delay_ms);
+    sampleContext_t sampleCtx;
+    sampleCtx.sampleBuffer = std::vector<std::complex<float>>(RTL_READ_SIZE/2);
 
     // Initialize squelch state
     last_signal_above_threshold = std::chrono::steady_clock::now();
@@ -967,8 +977,9 @@ int main(int argc, char* argv[]) {
         // Continue anyway - the streaming thread will handle reconnection
     }
     
+    sampleCtx.dev = g_dev;
     // Start RTL-SDR thread
-    std::thread rtl_thread(rtl_thread_function, g_dev);
+    std::thread rtl_thread(rtl_thread_function, &sampleCtx);
     
     // Start Icecast streaming thread
     std::thread icecast_thread(icecast_thread_function, shout);
@@ -993,63 +1004,141 @@ int main(int argc, char* argv[]) {
     
     while (running) 
     {
-        auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_status_time).count() >= 1) {
-            if (!quiet) {
-                print_status();
-            }
-            last_status_time = now;
-        }
-
-        // Check if we have enough samples
-        bool have_chunk = false;
+        if (sampleCtx.isSampleBufferReady)
         {
-            std::lock_guard<std::mutex> lock(buffer_mutex);
-            have_chunk = audio_buffer.size() >= CHUNK_SIZE;
-        }
-        
-        if (have_chunk) {
-            // Extract chunk and convert to PCM            
+            std::vector<std::complex<float>> filtered_samples(sampleCtx.sampleBufferLen);
+            float sum_squared = 0.0f;
+
+            for(int i=0; i< sampleCtx.sampleBufferLen; i++)
+            {
+                std::complex<float> sample = sampleCtx.sampleBuffer[i];
+                // Apply FM channel filter
+                std::complex<float> filtered;
+                iirfilt_crcf_execute(filter, sample, &filtered);
+                filtered_samples[i/2] = filtered;
+            }
+            
+            sampleCtx.isSampleBufferReady = false;
+
+            float rms = std::sqrt(sum_squared / sampleCtx.sampleBufferLen);
+            float db = 20 * std::log10(rms + 1e-10);
+            signal_strength.store(db);
+            
+            // Check squelch
+            bool is_squelched = false;
+            if (g_config.squelch_enabled) {
+                auto now = std::chrono::steady_clock::now();
+                if (db >= g_config.squelch_threshold) {
+                    // Signal is above threshold, update the timestamp
+                    last_signal_above_threshold = now;
+                    squelch_active = false;
+                } else {
+                    // Check if we're within the hold time
+                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now - last_signal_above_threshold).count();
+                    if (elapsed > g_config.squelch_hold_time) {
+                        squelch_active = true;
+                        is_squelched = true;
+                    }
+                }
+            }
+            
+            // Process IQ samples
+            std::vector<float> demod_buffer(sampleCtx.sampleBufferLen);
+            for (uint32_t i = 0; i < sampleCtx.sampleBufferLen; i++) {
+                if (current_mode == ModulationMode::AM_MODE) demod_buffer[i] = std::abs(filtered_samples[i]);
+                else demod_buffer[i] = fm_demod(prev_sample, filtered_samples[i]);
+                prev_sample = filtered_samples[i];
+            }
+            
+            // Resample to audio rate
+            std::vector<float> resampled_buffer(static_cast<size_t>(2.0f * demod_buffer.size()));  // Extra space for 1% more samples
+            unsigned int num_written;
+            msresamp_rrrf_execute(resampler,
+                                 demod_buffer.data(),
+                                 demod_buffer.size(),
+                                 resampled_buffer.data(),
+                                 &num_written);
+            
+            // Apply low-cut filter if enabled
+            if (g_config.lowcut_enabled && lowcut_filter && !is_squelched) {
+                for (unsigned int i = 0; i < num_written; i++) {
+                    float filtered_sample;
+                    iirfilt_rrrf_execute(lowcut_filter, resampled_buffer[i], &filtered_sample);
+                    resampled_buffer[i] = filtered_sample;
+                }
+            }
+            
+            // Add to buffer (apply squelch if needed)
             {
                 std::lock_guard<std::mutex> lock(buffer_mutex);
-                for (int i = 0; i < CHUNK_SIZE; i++) {
-                    float sample = std::max(-1.0f, std::min(1.0f, audio_buffer.front()));
-                    sample *= 0.7f; // Prevent clipping
-                    pcm_buffer[i] = static_cast<short>(sample * 32767.0f);
-                    audio_buffer.pop_front();
+                for (unsigned int i = 0; i < num_written; i++) {
+                    // If squelched, add silence instead of the actual sample
+                    float sample = is_squelched ? 0.0f : resampled_buffer[i];
+                    audio_buffer.push_back(sample);
                 }
             }
-            
-            // Encode to MP3
-            int mp3_size = lame_encode_buffer(lame,
-                                            pcm_buffer.data(),
-                                            nullptr,
-                                            CHUNK_SIZE,
-                                            mp3_buffer.data(),
-                                            mp3_buffer.size());
-            
-            if (mp3_size > 0) {
-                // Add MP3 data to queue
-                std::lock_guard<std::mutex> lock(mp3_buffer_mutex);
-                if (mp3_queue.size() < MAX_MP3_QUEUE_SIZE) {
-                    MP3Chunk chunk;
-                    chunk.data.assign(mp3_buffer.begin(), mp3_buffer.begin() + mp3_size);
-                    chunk.size = mp3_size;
-                    mp3_queue.push_back(std::move(chunk));
-                } else {
-                    std::cerr << "MP3 queue full, dropping chunk\n";
+        
+#if 1
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - last_status_time).count() >= 1) {
+                if (!quiet) {
+                    print_status();
                 }
+                last_status_time = now;
             }
-        } else {
-            // Add a small sleep to prevent busy waiting
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
 
-        if (g_config.scanEnabled) {
-            double frq = scanner->NextCh(squelch_active);
-            if (frq != 0) {
-                change_frequency(frq);
+            // Check if we have enough samples
+            bool have_chunk = false;
+            {
+                std::lock_guard<std::mutex> lock(buffer_mutex);
+                have_chunk = audio_buffer.size() >= CHUNK_SIZE;
             }
+            
+            if (have_chunk) {
+                // Extract chunk and convert to PCM            
+                {
+                    std::lock_guard<std::mutex> lock(buffer_mutex);
+                    for (int i = 0; i < CHUNK_SIZE; i++) {
+                        float sample = std::max(-1.0f, std::min(1.0f, audio_buffer.front()));
+                        sample *= 0.7f; // Prevent clipping
+                        pcm_buffer[i] = static_cast<short>(sample * 32767.0f);
+                        audio_buffer.pop_front();
+                    }
+                }
+                
+                // Encode to MP3
+                int mp3_size = lame_encode_buffer(lame,
+                                                pcm_buffer.data(),
+                                                nullptr,
+                                                CHUNK_SIZE,
+                                                mp3_buffer.data(),
+                                                mp3_buffer.size());
+                
+                if (mp3_size > 0) {
+                    // Add MP3 data to queue
+                    std::lock_guard<std::mutex> lock(mp3_buffer_mutex);
+                    if (mp3_queue.size() < MAX_MP3_QUEUE_SIZE) {
+                        MP3Chunk chunk;
+                        chunk.data.assign(mp3_buffer.begin(), mp3_buffer.begin() + mp3_size);
+                        chunk.size = mp3_size;
+                        mp3_queue.push_back(std::move(chunk));
+                    } else {
+                        std::cerr << "MP3 queue full, dropping chunk\n";
+                    }
+                }
+            } else {
+                // Add a small sleep to prevent busy waiting
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+
+            if (g_config.scanEnabled) {
+                double frq = scanner->NextCh(squelch_active);
+                if (frq != 0) {
+                    change_frequency(frq);
+                }
+            }
+#endif // 0
         }
     }
     
