@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include "config.h"
 #include "scanner.h"
+#include "fft.h"
 
 // Global configuration
 Config g_config;
@@ -58,9 +59,16 @@ iirfilt_rrrf lowcut_filter = nullptr;  // Low-cut filter
 #define CHUNK_SIZE (AUDIO_RATE * AUDIO_BUFFER_IN_SECONDS)  // 10 seconds of audio
 #define MP3_BUFFER_SIZE (CHUNK_SIZE * 2)  // Plenty of space for MP3 data
 
+#define safe_cond_signal(n, m) pthread_mutex_lock(m); pthread_cond_signal(n); pthread_mutex_unlock(m)
+#define safe_cond_wait(n, m) pthread_mutex_lock(m); pthread_cond_wait(n, m); pthread_mutex_unlock(m)
+
+pthread_cond_t hop;
+pthread_mutex_t hop_m;
+
 std::atomic<bool> running{true};
 std::atomic<bool> icecast_connected{false};  // Track Icecast connection state
 std::mutex buffer_mutex;
+std::mutex rtlsdr_f_mutex;
 std::deque<float> audio_buffer;  // Growing buffer for audio samples
 std::chrono::steady_clock::time_point last_stats_time;
 msresamp_rrrf resampler;  // Make resampler global so callback can access it
@@ -89,6 +97,8 @@ struct StatusInfo {
     bool connected{false};
 };
 StatusInfo current_status;
+
+void change_frequency(double new_freq_mhz);
 
 // Timestamp for metadata updates
 std::chrono::steady_clock::time_point last_metadata_update;
@@ -341,6 +351,7 @@ void rtl_callback(unsigned char *buf, uint32_t len, void *) {
     float sum_squared = 0.0f;
     float bw_squared = 0.0f;
     std::vector<std::complex<float>> filtered_samples(len/2);
+    std::vector<std::complex<float>> samples(len/2);
     
     // Convert samples and apply filtering
     for (uint32_t i = 0; i < len; i += 2) {
@@ -348,6 +359,8 @@ void rtl_callback(unsigned char *buf, uint32_t len, void *) {
         float q_sample = (buf[i + 1] - 127.5f) / 127.5f;
         std::complex<float> sample(i_sample, q_sample);
         
+        samples[i/2] = sample;
+
         bw_squared += std::norm(sample);
 
         // Apply FM channel filter
@@ -357,6 +370,9 @@ void rtl_callback(unsigned char *buf, uint32_t len, void *) {
         
         sum_squared += std::norm(filtered);
     }
+
+    //printf("samples[0] %f %f\n", samples[0].real(), samples[0].imag());
+    int fft_snr = fft_psd(samples);
     
     float bw_rms = std::sqrt(bw_squared / (len/2));
     float bw_db = 20 * std::log10(bw_rms + 1e-10);
@@ -373,27 +389,29 @@ void rtl_callback(unsigned char *buf, uint32_t len, void *) {
 
     // Check squelch
     static bool is_squelched = true;
-#if 1 // SNR squelch
-    if (snr > 3.0f) {
+#if 0 // SNR squelch
+    if (snr >= 6.0f) {
+#endif // 0
+#if 1 // FFT squelch
+    //printf("%d\n", fft_snr);
+    if (fft_snr >= 17) {
+#endif // 0
         squelch_active = false;
         //updateMetadata = true;
         //metadB = db;
         is_squelched = false;
-        printf("SNR(%f)\n", snr);
+        printf("SNR(%.1f) of %.3f MHz %d\n", snr, g_config.center_freq, fft_snr);
     }
     else {
+        if (!squelch_active) {
+            printf("- SNR(%.1f) of %.3f MHz %d\n", snr, g_config.center_freq, fft_snr);
+            //safe_cond_signal(&hop, &hop_m);
+        }
+        safe_cond_signal(&hop, &hop_m);
         squelch_active = true;
         is_squelched = true;
-#if 0
-        if (g_config.scanEnabled) {
-            double frq = scanner->NextCh(squelch_active);
-            if (frq != 0) {
-                change_frequency(frq);
-            }
-        }
-#endif // 0
     }
-#endif // 0
+//#endif // 0
 
 #if 0 // hystereesi squelch
     if (g_config.squelch_enabled) {
@@ -474,6 +492,19 @@ void rtl_thread_function(rtlsdr_dev_t *dev) {
         running = false;
     }
     printf("RTL-SDR thread ending\n");
+}
+
+void scanning_thread_function(Scanner *scanner) {
+    while(running) {
+        safe_cond_wait(&hop, &hop_m);
+        //printf("scanning_thread\n");
+        if (g_config.scanEnabled) {
+            double frq = scanner->NextCh(squelch_active);
+            if (frq != 0) {
+                change_frequency(frq);
+            }
+        }
+    }
 }
 
 // Function to update Icecast metadata
@@ -584,9 +615,12 @@ bool reconnect_icecast(shout_t* &shout) {
         icecast_connected = true;
         
         // Set initial metadata
+#if 0
         uint32_t current_freq = rtlsdr_get_center_freq(g_dev);
         float current_freq_mhz = current_freq / 1e6;
         update_icecast_metadata(shout, current_freq_mhz, signal_strength.load());
+#endif // 0
+        update_icecast_metadata(shout, g_config.center_freq, signal_strength.load());
         last_metadata_update = std::chrono::steady_clock::now();
         
         return true;
@@ -622,9 +656,12 @@ void icecast_thread_function(shout_t* shout) {
             std::chrono::duration_cast<std::chrono::seconds>(now - last_metadata_update).count() >= METADATA_UPDATE_INTERVAL_SEC) {
             
             if (g_dev) {
+#if 0
                 uint32_t current_freq = rtlsdr_get_center_freq(g_dev);
                 float current_freq_mhz = current_freq / 1e6;
                 update_icecast_metadata(shout, current_freq_mhz, signal_strength.load());
+#endif // 0
+                update_icecast_metadata(shout, g_config.center_freq, signal_strength.load());
             }
             last_metadata_update = now;
         }
@@ -806,6 +843,7 @@ void change_frequency(double new_freq_mhz) {
     if (!g_dev) return;
     
     uint32_t freq_hz = static_cast<uint32_t>(new_freq_mhz * 1e6);
+    std::lock_guard<std::mutex> lock(rtlsdr_f_mutex);
     if (rtlsdr_set_center_freq(g_dev, freq_hz) < 0) {
         std::cerr << "Failed to set frequency to " << new_freq_mhz << " MHz\n";
     } else {
@@ -871,6 +909,9 @@ int main(int argc, char* argv[]) {
         std::cerr << "Error loading config: " << e.what() << std::endl;
         return 1;
     }
+
+    pthread_cond_init(&hop, NULL);
+	pthread_mutex_init(&hop_m, NULL);
 
     printf("scanlist size %ld\n", g_config.scanlist.size());
     for (std::size_t ind = 0; ind < g_config.scanlist.size(); ind++ ) {
@@ -997,6 +1038,9 @@ int main(int argc, char* argv[]) {
         // Continue anyway - the streaming thread will handle reconnection
     }
     
+    // Start scanning thread
+    std::thread scanning_thread(scanning_thread_function, scanner);
+
     // Start RTL-SDR thread
     std::thread rtl_thread(rtl_thread_function, g_dev);
     
@@ -1011,6 +1055,7 @@ int main(int argc, char* argv[]) {
     
     // pre-buffer
     printf("Pre-buffering...\n");
+
     while (true) {
         std::lock_guard<std::mutex> lock(buffer_mutex);
         if (audio_buffer.size() >= CHUNK_SIZE*2) {
@@ -1075,6 +1120,7 @@ int main(int argc, char* argv[]) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
 
+#if 0
         if (g_config.scanEnabled) {
             if (squelch_active) {
                 double frq = scanner->NextCh(squelch_active);
@@ -1083,6 +1129,7 @@ int main(int argc, char* argv[]) {
                 }
             }
         }
+#endif // 0
     }
     
     // Cleanup
@@ -1101,6 +1148,8 @@ int main(int argc, char* argv[]) {
         iirfilt_rrrf_destroy(lowcut_filter);
     }
     
+    pthread_cond_destroy(&hop);
+	pthread_mutex_destroy(&hop_m);
     delete scanner;
     rtlsdr_close(g_dev);
     lame_close(lame);

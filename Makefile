@@ -10,10 +10,10 @@ ifeq ($(UNAME_S),Darwin)
     LDFLAGS = -L/opt/homebrew/lib -lrtlsdr -lliquid -lmp3lame -lshout -lm -lpthread
 else
     # Linux and other systems
-    LDFLAGS = -lrtlsdr -lliquid -lmp3lame -lshout -lm -lpthread
+    LDFLAGS = -lrtlsdr -lliquid -lmp3lame -lshout -lm -lpthread -lfftw3
 endif
 
-SOURCES = rtl_icecast.cpp config.cpp scanner.cpp
+SOURCES = rtl_icecast.cpp config.cpp scanner.cpp fft.cpp
 BUILD_DIR = build
 OBJECTS = $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(SOURCES))
 TARGET = $(BUILD_DIR)/rtl_icecast

@@ -34,6 +34,9 @@ double Scanner::NextCh(bool sql)
             }
         } 
     }
+    else {
+        last_time = std::chrono::steady_clock::now();
+    }
 
     return retval;
 }

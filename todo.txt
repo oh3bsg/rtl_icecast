@@ -1,0 +1,6 @@
+- Metadatan päivitys "taajuus - selitys [-12.8 dB]"
+- Auto squelch level
+- Multimode. Skannaa sekä AM että NFM
+- Stream Description konffi filuun
+- fall-back https://stackoverflow.com/questions/5573396/icecast-server-fall-back-file
+- header file dependency puuttuu
